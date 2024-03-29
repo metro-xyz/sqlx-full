@@ -1,4 +1,5 @@
 use crate::connection::LogSettings;
+use regex::RegexBuilder;
 use std::time::Instant;
 
 // Yes these look silly. `tracing` doesn't currently support dynamic levels
@@ -55,6 +56,7 @@ pub fn private_level_filter_to_levels(
 }
 
 pub use sqlformat;
+use tracing::{info_span, Span};
 
 pub struct QueryLogger<'q> {
     sql: &'q str,
@@ -62,16 +64,29 @@ pub struct QueryLogger<'q> {
     rows_affected: u64,
     start: Instant,
     settings: LogSettings,
+    span: Span,
 }
 
 impl<'q> QueryLogger<'q> {
     pub fn new(sql: &'q str, settings: LogSettings) -> Self {
+        let trimmed_query = trim_query(sql);
         Self {
             sql,
             rows_returned: 0,
             rows_affected: 0,
             start: Instant::now(),
             settings,
+            span: info_span!(
+                target: "sqlx::query-trace",
+                "query",
+                resource.name = trimmed_query.as_str(),
+                "span.type" = "db",
+                span.kind = "client",
+                service = "sqlx",
+                db.system = "postgres",
+                db.operation = trimmed_query.as_str(),
+                db.row_count = tracing::field::Empty,
+            ),
         }
     }
 
@@ -84,6 +99,14 @@ impl<'q> QueryLogger<'q> {
     }
 
     pub fn finish(&self) {
+        self.span.record(
+            "db.row_count",
+            if self.rows_affected > 0 {
+                self.rows_affected
+            } else {
+                self.rows_returned
+            },
+        );
         let elapsed = self.start.elapsed();
 
         let was_slow = elapsed >= self.settings.slow_statements_duration;
@@ -165,4 +188,101 @@ pub fn parse_query_summary(sql: &str) -> String {
         .take(4)
         .collect::<Vec<&str>>()
         .join(" ")
+}
+
+pub fn trim_query(sql: &str) -> String {
+    // First, trim the string to remove leading and trailing whitespace
+    let trimmed_sql = sql.trim();
+
+    // Use a regex to find the minimum indentation (spaces) before any non-space character in all lines
+
+    let indent_regex = RegexBuilder::new(r"^( +)\S")
+        .multi_line(true)
+        .build()
+        .unwrap();
+    let mut min_indent = None;
+
+    for cap in indent_regex.captures_iter(trimmed_sql) {
+        let indent = cap.get(1).unwrap().as_str().len();
+        min_indent = Some(min_indent.map_or(indent, |min: usize| usize::min(min, indent)));
+    }
+
+    // Dedent each line based on the minimum indentation found
+    if let Some(indent) = min_indent {
+        let dedent_regex = RegexBuilder::new(&format!(r"^[ ]{{1,{}}}", indent))
+            .multi_line(true)
+            .build()
+            .unwrap();
+        dedent_regex.replace_all(trimmed_sql, "").to_string()
+    } else {
+        // If no indentation was found, just return the trimmed string
+        trimmed_sql.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_trim_query_already_trimmed() {
+        let sql = "SELECT * FROM table WHERE column = 'value';";
+        assert_eq!(
+            trim_query(sql),
+            "SELECT * FROM table WHERE column = 'value';"
+        );
+    }
+
+    #[test]
+    fn test_trim_query_simple_dedent() {
+        let sql = "
+            SELECT * FROM table WHERE column = 'value';
+        ";
+        assert_eq!(
+            trim_query(sql),
+            "SELECT * FROM table WHERE column = 'value';"
+        );
+    }
+
+    #[test]
+    fn test_trim_query_complex_dedent() {
+        let sql = "
+                SELECT id, name
+                FROM users
+                WHERE age > 18
+                ORDER BY name;
+        ";
+        let expected = "SELECT id, name\nFROM users\nWHERE age > 18\nORDER BY name;";
+        assert_eq!(trim_query(sql), expected);
+    }
+
+    #[test]
+    fn test_trim_query_mixed_indentation() {
+        let sql = "
+                SELECT id, name
+            FROM users
+                  WHERE age > 18
+                ORDER BY name;
+        ";
+        let expected = "SELECT id, name\nFROM users\n      WHERE age > 18\n    ORDER BY name;";
+        assert_eq!(trim_query(sql), expected);
+    }
+
+    #[test]
+    fn test_trim_query_empty_string() {
+        let sql = "";
+        assert_eq!(trim_query(sql), "");
+    }
+
+    #[test]
+    fn test_trim_query_spaces_only() {
+        let sql = "     ";
+        assert_eq!(trim_query(sql), "");
+    }
+
+    #[test]
+    fn test_trim_query_newlines_only() {
+        let sql = "\n\n";
+        assert_eq!(trim_query(sql), "");
+    }
 }
